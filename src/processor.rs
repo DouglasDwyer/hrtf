@@ -2,6 +2,8 @@
 //!
 //! See the crate docs for a description of the algorithm.
 
+#[cfg(hrtf_simd)]
+use crate::kernel;
 use crate::{lerpf, HrirSphere, Vec3};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -9,6 +11,18 @@ use std::sync::Arc;
 
 /// Input samples are processed in chunks of at most this size, which bounds the accumulator's size.
 const CHUNK: usize = 128;
+
+/// Zeros stored before and after every HRIR so that the SIMD kernel can read past their ends.
+#[cfg(hrtf_simd)]
+const HRIR_PAD: usize = kernel::HRIR_PAD;
+#[cfg(not(hrtf_simd))]
+const HRIR_PAD: usize = 0;
+
+/// Extra accumulator space that the SIMD kernel may touch.
+#[cfg(hrtf_simd)]
+const ACC_OVERSHOOT: usize = kernel::ACC_OVERSHOOT;
+#[cfg(not(hrtf_simd))]
+const ACC_OVERSHOOT: usize = 0;
 
 /// Marker for a triangle edge with no neighboring triangle.
 const NO_NEIGHBOR: u32 = u32::MAX;
@@ -26,6 +40,7 @@ const MAX_WALK_STEPS: usize = 16;
 
 /// Fused multiply-add where the hardware supports it. Falls back to separate operations
 /// otherwise because `f32::mul_add` is extremely slow without FMA instructions.
+#[cfg(not(hrtf_simd))]
 #[inline(always)]
 fn fma(a: f32, b: f32, c: f32) -> f32 {
     #[cfg(target_feature = "fma")]
@@ -86,9 +101,11 @@ fn weights_if_inside(lambda: [f32; 3]) -> Option<[f32; 3]> {
 struct HrtfSphereInner {
     /// Length of every HRIR.
     length: usize,
-    /// All impulse responses. For point `p` and tap `k`, the left sample is at index
-    /// `2 * (p * length + k)` and the right sample is right after it.
+    /// All impulse responses, each surrounded by `HRIR_PAD` zeros. For point `p` and tap `k`, the
+    /// left sample is at index `p * row + HRIR_PAD + 2 * k` and the right sample is right after it.
     hrirs: Vec<f32>,
+    /// The number of floats between the starts of consecutive points in `hrirs`.
+    row: usize,
     triangles: Vec<Triangle>,
     source: PathBuf,
 }
@@ -111,12 +128,15 @@ impl HrtfSphere {
         );
 
         let length = hrir_sphere.length;
-        let mut hrirs = Vec::with_capacity(hrir_sphere.points.len() * length * 2);
+        let row = 2 * length + 2 * HRIR_PAD;
+        let mut hrirs = Vec::with_capacity(hrir_sphere.points.len() * row);
         for point in &hrir_sphere.points {
+            hrirs.resize(hrirs.len() + HRIR_PAD, 0.0);
             for (&left, &right) in point.left_hrir.iter().zip(&point.right_hrir) {
                 hrirs.push(left);
                 hrirs.push(right);
             }
+            hrirs.resize(hrirs.len() + HRIR_PAD, 0.0);
         }
 
         let mut triangles = hrir_sphere
@@ -173,6 +193,7 @@ impl HrtfSphere {
         Self(Arc::new(HrtfSphereInner {
             length,
             hrirs,
+            row,
             triangles,
             source: hrir_sphere.source.clone(),
         }))
@@ -252,10 +273,49 @@ impl HrtfSphereInner {
 }
 
 /// Adds `w0 * h0 + w1 * h1 + w2 * h2` to `acc`.
+#[cfg(not(hrtf_simd))]
 #[inline(always)]
 fn scatter(acc: &mut [f32], h0: &[f32], h1: &[f32], h2: &[f32], w0: f32, w1: f32, w2: f32) {
     for (((a, &x0), &x1), &x2) in acc.iter_mut().zip(h0).zip(h1).zip(h2) {
         *a = fma(w0, x0, fma(w1, x1, fma(w2, x2, *a)));
+    }
+}
+
+/// A stretch of consecutive input samples in one chunk that all fall in the same triangle.
+/// Samples between `first` and `end` that were silent have weights of zero.
+#[cfg(hrtf_simd)]
+struct Run {
+    triangle: usize,
+    first: usize,
+    end: usize,
+}
+
+#[cfg(hrtf_simd)]
+impl Default for Run {
+    fn default() -> Self {
+        Self {
+            triangle: usize::MAX,
+            first: 0,
+            end: 0,
+        }
+    }
+}
+
+#[cfg(hrtf_simd)]
+impl Run {
+    /// Adds the response to this run's samples to `accumulator`.
+    fn flush(&self, sphere: &HrtfSphereInner, accumulator: &mut [f32], weights: &[[f32; 3]]) {
+        if self.end > self.first {
+            let [v0, v1, v2] = sphere.triangles[self.triangle].vertices;
+            let row = |v: u32| &sphere.hrirs[v as usize * sphere.row..][..sphere.row];
+            kernel::accumulate(
+                accumulator,
+                [row(v0), row(v1), row(v2)],
+                2 * sphere.length,
+                self.first,
+                &weights[self.first..self.end],
+            );
+        }
     }
 }
 
@@ -290,7 +350,7 @@ pub struct HrtfProcessor {
 impl HrtfProcessor {
     /// Creates a new processor for a single source.
     pub fn new(sphere: HrtfSphere) -> Self {
-        let accumulator = vec![0.0; 2 * (sphere.len() + CHUNK - 1)];
+        let accumulator = vec![0.0; 2 * (sphere.len() + CHUNK - 1) + ACC_OVERSHOOT];
         Self {
             sphere,
             accumulator,
@@ -398,6 +458,7 @@ impl HrtfProcessor {
         assert!(output.len() >= source.len());
 
         let sphere = &*self.sphere.0;
+        #[cfg(not(hrtf_simd))]
         let stride = 2 * sphere.length;
         let accumulator = &mut self.accumulator[..];
         let mut direction = self.direction;
@@ -406,6 +467,12 @@ impl HrtfProcessor {
 
         let chunks = source.chunks(CHUNK).zip(output.chunks_mut(CHUNK));
         for (chunk_index, (input, output)) in chunks.enumerate() {
+            // Consecutive samples in the same triangle are convolved together as a "run".
+            #[cfg(hrtf_simd)]
+            let mut weights = [[0.0f32; 3]; CHUNK];
+            #[cfg(hrtf_simd)]
+            let mut run = Run::default();
+
             for (j, &sample) in input.iter().enumerate() {
                 let (sample_direction, sample_gain) = at(chunk_index * CHUNK + j);
                 if is_usable_direction(sample_direction) {
@@ -418,19 +485,39 @@ impl HrtfProcessor {
                     let (found, w) = sphere.locate(direction, triangle);
                     triangle = found;
 
-                    let [v0, v1, v2] = sphere.triangles[found].vertices;
-                    let hrir = |v: u32| &sphere.hrirs[v as usize * stride..][..stride];
-                    scatter(
-                        &mut accumulator[2 * j..][..stride],
-                        hrir(v0),
-                        hrir(v1),
-                        hrir(v2),
-                        scaled * w[0],
-                        scaled * w[1],
-                        scaled * w[2],
-                    );
+                    #[cfg(not(hrtf_simd))]
+                    {
+                        let [v0, v1, v2] = sphere.triangles[found].vertices;
+                        let hrir =
+                            |v: u32| &sphere.hrirs[v as usize * sphere.row + HRIR_PAD..][..stride];
+                        scatter(
+                            &mut accumulator[2 * j..][..stride],
+                            hrir(v0),
+                            hrir(v1),
+                            hrir(v2),
+                            scaled * w[0],
+                            scaled * w[1],
+                            scaled * w[2],
+                        );
+                    }
+                    #[cfg(hrtf_simd)]
+                    {
+                        if run.triangle != found {
+                            run.flush(sphere, accumulator, &weights);
+                            run = Run {
+                                triangle: found,
+                                first: j,
+                                end: j,
+                            };
+                        }
+                        weights[j] = [scaled * w[0], scaled * w[1], scaled * w[2]];
+                        run.end = j + 1;
+                    }
                 }
             }
+
+            #[cfg(hrtf_simd)]
+            run.flush(sphere, accumulator, &weights);
 
             // The first `input.len()` accumulated samples are now complete.
             for (j, out) in output.iter_mut().enumerate() {

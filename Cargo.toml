@@ -15,5 +15,6 @@ readme = "README.md"
 rubato = { version = "5.0.0", default-features = false }
 
 [lints.rust]
+# `hrtf_simd` enables the nightly-only `std::simd` kernel.
 # `nightly_bench` enables the `#[bench]` benchmarks in `benches/`, which need a nightly compiler.
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(nightly_bench)"] }
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(nightly_bench)", "cfg(hrtf_simd)"] }

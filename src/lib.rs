@@ -40,12 +40,17 @@
 #![allow(clippy::len_without_is_empty)]
 #![allow(clippy::many_single_char_names)]
 #![allow(clippy::manual_range_contains)]
-#![forbid(unsafe_code)]
+// The `hrtf_simd` kernel needs one `unsafe` call to select a `#[target_feature]` function at run time.
+#![cfg_attr(not(hrtf_simd), forbid(unsafe_code))]
+#![cfg_attr(hrtf_simd, deny(unsafe_code))]
+#![cfg_attr(hrtf_simd, feature(portable_simd))]
 #![warn(missing_docs)]
 
 // Resampling.
 extern crate rubato;
 
+#[cfg(hrtf_simd)]
+mod kernel;
 mod processor;
 
 pub use processor::{HrtfProcessor, HrtfSphere};
