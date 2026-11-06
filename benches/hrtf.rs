@@ -3,7 +3,8 @@
 //!
 //! To run (nightly only; the cfg keeps `cargo build --all-targets` working on stable):
 //! `RUSTFLAGS="--cfg nightly_bench" cargo +nightly bench --bench hrtf`
-//! Add `-C target-cpu=x86-64-v3` (or `native`) to RUSTFLAGS to enable AVX2/FMA.
+//! Add `-C target-cpu=x86-64-v3` (or `native`) to RUSTFLAGS to enable AVX2/FMA, and
+//! `--cfg hrtf_simd` to benchmark the `std::simd` kernel instead of the scalar loop.
 //!
 //! To compare with the old FFT implementation, run the same workload on the base commit: see the
 //! instructions at the top of `baseline/hrtf_fft.rs`. Keep the two workloads in sync.

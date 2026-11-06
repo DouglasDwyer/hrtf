@@ -70,3 +70,13 @@ RUSTFLAGS="--cfg nightly_bench" cargo +nightly bench --bench hrtf
 To compare with the previous FFT implementation, see the instructions at the top of
 `benches/baseline/hrtf_fft.rs`. The time-domain processor benefits considerably from AVX2/FMA, so also
 try `RUSTFLAGS="--cfg nightly_bench -C target-cpu=x86-64-v3"`.
+
+# SIMD kernel (nightly)
+
+With `RUSTFLAGS="--cfg hrtf_simd"` on a nightly compiler, the convolution uses a `std::simd` kernel
+(`src/kernel.rs`). Consecutive samples that fall in the same sphere triangle are convolved together
+with a register-blocked loop, which is limited by FMA throughput instead of by load/store ports. On
+x86 the AVX2 + FMA version is picked at run time, so it is used even when the crate is not built with
+`target-cpu`. The sphere stores a few zeros of padding around every HRIR (about 16% more memory) for
+the kernel. This is the only use of `unsafe` in the crate (a call to a `#[target_feature]` function after
+feature detection); without the cfg the crate still forbids `unsafe` and builds on stable.

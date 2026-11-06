@@ -204,3 +204,97 @@ fn accumulate_impl<const LANES: usize, const FMA: bool>(
         offset += tile;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lcg(state: &mut u32) -> f32 {
+        *state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+        (*state >> 8) as f32 / (1u32 << 23) as f32 - 1.0
+    }
+
+    /// Compares the kernel against the definition, for many run lengths and positions.
+    fn check<const LANES: usize, const FMA: bool>() {
+        let stride = 2 * 37; // not a multiple of any tile size
+        let mut rng = 12345;
+        let rows: Vec<Vec<f32>> = (0..3)
+            .map(|_| {
+                let mut row = vec![0.0; stride + 2 * HRIR_PAD];
+                for x in &mut row[HRIR_PAD..HRIR_PAD + stride] {
+                    *x = lcg(&mut rng);
+                }
+                row
+            })
+            .collect();
+
+        for len in [1, 2, 3, 7, 8, 9, 15, 16, 17, 31, 64, 100, 127, 128] {
+            for first in [0, 1, 5, 128 - len].map(|f| f.min(128 - len)) {
+                let weights: Vec<[f32; 3]> = (0..len)
+                    .map(|j| {
+                        if j % 11 == 5 {
+                            [0.0; 3]
+                        } else {
+                            [lcg(&mut rng), lcg(&mut rng), lcg(&mut rng)]
+                        }
+                    })
+                    .collect();
+
+                let acc_len = 2 * (stride / 2 + 128 - 1) + ACC_OVERSHOOT;
+                let mut expected: Vec<f32> = (0..acc_len).map(|_| lcg(&mut rng)).collect();
+                let mut actual = expected.clone();
+                for j in 0..len {
+                    for v in 0..3 {
+                        for k in 0..stride {
+                            expected[2 * (first + j) + k] += weights[j][v] * rows[v][HRIR_PAD + k];
+                        }
+                    }
+                }
+
+                accumulate_impl::<LANES, FMA>(
+                    &mut actual,
+                    [&rows[0], &rows[1], &rows[2]],
+                    stride,
+                    first,
+                    &weights,
+                );
+                for (i, (a, e)) in actual.iter().zip(&expected).enumerate() {
+                    assert!(
+                        (a - e).abs() <= 1e-4 * (1.0 + e.abs()),
+                        "len {} first {} index {}: {} != {}",
+                        len,
+                        first,
+                        i,
+                        a,
+                        e
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn four_lanes_match_definition() {
+        check::<4, false>();
+    }
+
+    #[test]
+    fn eight_lanes_match_definition() {
+        check::<8, false>();
+    }
+
+    #[test]
+    fn selected_kernel_matches_definition() {
+        // Whatever `accumulate` picks on this machine.
+        let stride = 2 * 37;
+        let mut row = vec![0.0; stride + 2 * HRIR_PAD];
+        row[HRIR_PAD..HRIR_PAD + stride].fill(1.0);
+        let mut acc = vec![0.0; 2 * (stride / 2 + 128) + ACC_OVERSHOOT];
+        let w = vec![[1.0; 3]; 100];
+        accumulate(&mut acc, [&row, &row, &row], stride, 3, &w);
+        // Output 3 only gets sample 3's first tap, output 40 gets samples 4 through 40.
+        assert_eq!(acc[2 * 3], 3.0);
+        assert_eq!(acc[2 * 3 + 1], 3.0);
+        assert_eq!(acc[2 * 40], 3.0 * 37.0);
+    }
+}
