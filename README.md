@@ -60,7 +60,7 @@ Use `HrtfProcessor::process_per_sample` to supply a direction and gain for every
 # Benchmarks
 
 `benches/hrtf.rs` contains `#[bench]` benchmarks (nightly Rust, no extra dependencies) that time one
-128-frame block for continuous, sparse (37.5% of blocks active) and silent input at 44.1 and 48 kHz,
+block (128 frames, or 4410) of continuous, sparse (37.5% of blocks active) and silent input at 44.1 and 48 kHz,
 using the IRCAM sphere in `benches/IRC_1003_C.bin` and a source whose direction sweeps every block.
 
 ```text
